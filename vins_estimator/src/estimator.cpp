@@ -1,9 +1,113 @@
 #include "estimator.h"
+#include "parameters.h"                 // for camera parameters like FOCAL_LENGTH, COL, ROW
+#include "homography_pose_estimator.h"  // homography estimator class
+#include <Eigen/Geometry>  // for Eigen::Quaterniond and slerp
+
+
 
 Estimator::Estimator(): f_manager{Rs}
 {
     ROS_INFO("init begins");
     clearState();
+
+    // create camera intrinsic matrix K
+    double fx = FOCAL_LENGTH;
+    double fy = FOCAL_LENGTH;
+    double cx = COL / 2.0;
+    double cy = ROW / 2.0;
+
+    cv::Mat K = (cv::Mat_<double>(3, 3) << fx, 0, cx,
+                                           0, fy, cy,
+                                           0,  0,  1);
+
+    // Instantiate the homography pose estimator
+    homo_estimator_.reset(new HomographyPoseEstimator(K));
+}
+
+bool Estimator::fuseHomographyWithVIO(const cv::Mat& R_cam,
+                                      const cv::Mat& t_cam,
+                                      int k_prev,
+                                      int k_curr)
+{
+    
+    // Convert homography outputs (OpenCV) to Eigen
+    Eigen::Matrix3d R_h_cam; // homography output - relative rotation C_prev → C_curr (camera frame)
+    Eigen::Vector3d t_h_cam;  // homography output - translation direction in camera frame
+    cv::cv2eigen(R_cam, R_h_cam);
+    cv::cv2eigen(t_cam,  t_h_cam);
+
+    if (t_h_cam.norm() < 1e-6) {
+        ROS_WARN("Homography t too small; skip fusion.");
+        return false;
+    }
+    Eigen::Vector3d dir_h_cam = t_h_cam.normalized(); // normalize to remove meaningless scale
+
+    // Map homography (camera frame) into IMU/body frame.
+    // ric[0] is the camera-IMU rotation used throughout VINS.
+    // In VINS-Mono, ric is "R_cam_to_imu". If your result looks flipped,
+    // try the transpose variant noted below.
+    // Eigen::Matrix3d R_ci = ric[0];
+    // Eigen::Matrix3d R_rel_h_body = R_ci * R_h_cam * R_ci.transpose();
+    // Eigen::Vector3d dir_h_body   = R_ci * dir_h_cam;
+    // (If your axes look inverted in tests, swap to:)
+    Eigen::Matrix3d R_ic = ric[0].transpose(); // IMU -> camera
+    Eigen::Matrix3d R_rel_h_body = R_ic.transpose() * R_h_cam * R_ic;
+    Eigen::Vector3d dir_h_body   = R_ic.transpose() * dir_h_cam;
+
+    // Get VINS predicted relative motion between k_prev and k_curr.
+    // Rs[]: world->IMU rotation; Ps[]: world position.
+    // Relative rotation in previous-IMU frame:
+    Eigen::Matrix3d R_rel_vio = Rs[k_prev].transpose() * Rs[k_curr]; // vins output - relative rotation B_prev → B_curr (body frame)
+
+    // Relative translation in previous-IMU frame:
+    Eigen::Vector3d t_rel_vio_world = Ps[k_curr] - Ps[k_prev];
+    Eigen::Vector3d t_rel_vio_body  = Rs[k_prev].transpose() * t_rel_vio_world; // vins output - translation direction in body frame
+    // (R_WB_prev)^T * R_WB_curr : rotates from B_prev to B_curr
+
+    // Extract scale and direction
+    double scale_vio = t_rel_vio_body.norm();
+    if (scale_vio < 1e-6) {
+        ROS_WARN("VIO motion too small; skip fusion.");
+        return false;
+    }
+
+    Eigen::Vector3d dir_vio = t_rel_vio_body.normalized(); // normalize to remove scale
+    Eigen::Vector3d dir_h   = dir_h_body.normalized(); // normalize to remove scale
+
+    // if directions disagree too much, skip fusion
+    double cosang = std::max(-1.0, std::min(1.0, dir_vio.dot(dir_h))); // cosine of angle between VIO and homography translation directions
+    double ang_deg = std::acos(cosang) * 180.0 / M_PI;
+    if (ang_deg > homo_max_dir_angle_deg_) {
+        ROS_WARN("Homography/VIO dir angle %.1f deg > %.1f deg; skip fusion.",
+                 ang_deg, homo_max_dir_angle_deg_);
+        return false;
+    }
+
+    // Blend rotations via SLERP, weighted toward VIO by (1 - homo_alpha_R_)    Eigen::Quaterniond q_vio(R_rel_vio);
+    Eigen::Quaterniond q_h(R_rel_h_body);
+    Eigen::Quaterniond q_fused = q_vio.slerp(homo_alpha_R_, q_h).normalized();
+    Eigen::Matrix3d R_rel_fused = q_fused.toRotationMatrix();
+
+    // Blend translation directions, but KEEP VIO SCALE
+    Eigen::Vector3d dir_mix = (1.0 - homo_alpha_t_) * dir_vio + homo_alpha_t_ * dir_h;
+    if (dir_mix.norm() < 1e-6) {
+        ROS_WARN("Blended dir too small; keep VIO.");
+        dir_mix = dir_vio;
+    } else {
+        dir_mix.normalize();
+    }
+    Eigen::Vector3d t_rel_fused_body = scale_vio * dir_mix; // metric // why just for tranlation?
+
+    // Only the *direction* is blended with homography; magnitude always comes
+    // from VIO, since homography cannot recover metric scale on its own.
+    Rs[k_curr] = Rs[k_prev] * R_rel_fused;
+    // Position is in world, so rotate body delta back to world and add
+    Ps[k_curr] = Ps[k_prev] + Rs[k_prev] * t_rel_fused_body;
+
+    ROS_INFO_STREAM("Homography fusion applied: angle=" << ang_deg
+                    << " deg, scale(VIO)=" << scale_vio);
+
+    return true;
 }
 
 void Estimator::setParameter()
@@ -136,6 +240,36 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     imageframe.pre_integration = tmp_pre_integration;
     all_image_frame.insert(make_pair(header.stamp.toSec(), imageframe));
     tmp_pre_integration = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]};
+
+    // --- homography pose estimation ---
+
+    if (frame_count > 0){
+        vector<pair<Eigen::Vector3d, Eigen::Vector3d>> corres = f_manager.getCorresponding(frame_count - 1, frame_count);
+
+        vector<cv::Point2f> pts_prev, pts_curr;
+        for (auto &p : corres)
+        {
+            pts_prev.push_back(cv::Point2f(p.first.x(), p.first.y()));
+            pts_curr.push_back(cv::Point2f(p.second.x(), p.second.y()));
+        }
+
+        cv::Mat R, t;
+        bool success = homo_estimator_->estimatePose(pts_prev, pts_curr, R, t);
+
+        if (success){
+            // Try to fuse with VIO (uses metric scale from VINS, direction from homography)
+            bool fused = fuseHomographyWithVIO(R, t, frame_count - 1, frame_count);
+            if (fused) {
+                vector2double(); // sync state into optimizer parameter arrays
+            } else {
+                ROS_WARN("Homography fusion skipped (gate or small motion).");
+            }
+        }
+        else{
+            ROS_WARN("Homography pose estimation failed.");
+        }
+
+    }
 
     if(ESTIMATE_EXTRINSIC == 2)
     {

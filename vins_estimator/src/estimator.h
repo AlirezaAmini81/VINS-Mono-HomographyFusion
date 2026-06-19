@@ -2,6 +2,7 @@
 
 #include "parameters.h"
 #include "feature_manager.h"
+#include "homography_pose_estimator.h"
 #include "utility/utility.h"
 #include "utility/tic_toc.h"
 #include "initial/solve_5pts.h"
@@ -136,4 +137,19 @@ class Estimator
     Vector3d relo_relative_t;
     Quaterniond relo_relative_q;
     double relo_relative_yaw;
+
+  private:
+    std::unique_ptr<HomographyPoseEstimator> homo_estimator_;
+
+    // --- Homography fusion settings  ---
+    double homo_alpha_R_ = 0.2;       // rotation blend weight [0..1]; 0.2 = mostly VINS, 20% homography
+    double homo_alpha_t_ = 0.3;       // translation-direction blend weight
+    double homo_max_dir_angle_deg_ = 120.0; // gate: if directions disagree > ... deg, skip fusion
+
+    // Fuse homography relative pose (cam frame) with VIO relative pose (IMU frame).
+    // k_prev = frame_count - 1, k_curr = frame_count
+    bool fuseHomographyWithVIO(const cv::Mat& R_cam,
+                               const cv::Mat& t_cam,
+                               int k_prev,
+                               int k_curr);
 };
